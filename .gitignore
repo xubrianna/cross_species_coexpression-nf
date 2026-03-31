@@ -1,0 +1,38 @@
+# Nextflow
+work/
+results/
+.nextflow*
+.nextflow.log*
+*.dot
+*.html
+*.svg
+*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Data files
+*.h5ad
+*.csv
+*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Conda
+.conda/
