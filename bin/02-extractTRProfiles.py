@@ -10,7 +10,7 @@ For each TR found in the matrix:
   - Output a ranked profile
 
 Input:  aggregated coexpression h5ad (genes x genes, rank-normalized)
-Output: parquet with columns [tr_symbol, ortholog_id, coexpr_value, n_genes, dataset_id]
+Output: CSV with columns [tr_symbol, ortholog_id, coexpr_value, n_genes, dataset_id]
 """
 
 import argparse
@@ -19,12 +19,10 @@ import numpy as np
 import anndata as ad
 from pathlib import Path
 
-
 def load_orthologs(ortholog_file):
     """Load DIOPT one-to-one ortholog table."""
     df = pd.read_csv(ortholog_file, sep='\t')
     return df
-
 
 def load_tfs(tf_file):
     """Load TF/TR list from AnimalTFDB."""
@@ -106,7 +104,7 @@ def main():
     parser.add_argument('--gene_mapping', default=None,
                         help='CSV mapping file with gene.ensembl and gene.symbol columns '
                              '(for converting Ensembl IDs to symbols)')
-    parser.add_argument('--output', required=True, help='Output parquet file')
+    parser.add_argument('--output', required=True, help='Output CSV file')
     args = parser.parse_args()
 
     # Load reference data
@@ -130,24 +128,58 @@ def main():
     input_path = Path(args.input)
     adata = ad.read_h5ad(input_path)
     cell_type, study_id = parse_file_metadata(input_path.name)
-    dataset_id = f"{cell_type}_{study_id}"
+    dataset_id = study_id
 
     # Convert Ensembl IDs to gene symbols if mapping provided
     if args.gene_mapping:
         mapping_df = pd.read_csv(args.gene_mapping)
-        ensmug_to_symbol = dict(zip(mapping_df['gene.ensembl'], mapping_df['gene.symbol']))
+
+        # Build one-to-many mapping: ensembl -> list of symbols
+        ensembl_to_symbols = (
+            mapping_df.groupby('gene.ensembl')['gene.symbol'].apply(list).to_dict()
+        )
+
         original_names = adata.var_names.tolist()
-        new_names = [ensmug_to_symbol.get(g, g) for g in original_names]
-        # Drop genes that couldn't be mapped (still have ENSMUSG prefix)
-        mapped_mask = [not n.startswith('ENSMUSG') for n in new_names]
-        n_mapped = sum(mapped_mask)
-        n_unmapped = len(mapped_mask) - n_mapped
-        adata = adata[:, mapped_mask]
-        adata.var_names = [n for n, m in zip(new_names, mapped_mask) if m]
-        # Handle any duplicate symbols after mapping (keep first)
-        if adata.var_names.duplicated().any():
-            adata = adata[:, ~adata.var_names.duplicated()]
-        print(f"  Gene mapping: {n_mapped} mapped, {n_unmapped} unmapped Ensembl IDs dropped")
+        coexpr = adata.X
+        if hasattr(coexpr, 'toarray'):
+            coexpr = coexpr.toarray()
+
+        # Map each Ensembl ID to symbol(s):
+        #   1 Ensembl -> many symbols: duplicate row/col with same values
+        #   Unmapped Ensembl IDs (no entry or still ENSMUSG prefix): dropped
+        new_names = []
+        src_indices = []
+        for i, name in enumerate(original_names):
+            symbols = ensembl_to_symbols.get(name)
+            if symbols:
+                for sym in symbols:
+                    new_names.append(sym)
+                    src_indices.append(i)
+            elif not name.startswith('ENSMUSG'):
+                # Already a symbol (keep as-is)
+                new_names.append(name)
+                src_indices.append(i)
+            # else: unmapped Ensembl ID, drop
+
+        n_unmapped = len(original_names) - len(set(src_indices))
+        src_indices = np.array(src_indices)
+
+        # Expand matrix (duplicates rows/cols for 1-Ensembl-to-many-symbols)
+        expanded = coexpr[np.ix_(src_indices, src_indices)]
+
+        # Average rows/cols with same symbol (many-Ensembl-to-1-symbol)
+        df_matrix = pd.DataFrame(expanded, index=new_names, columns=new_names)
+        if df_matrix.index.duplicated().any():
+            df_matrix = df_matrix.groupby(level=0).mean()
+            df_matrix = df_matrix.T.groupby(level=0).mean().T
+
+        adata = ad.AnnData(
+            X=df_matrix.values,
+            obs=pd.DataFrame(index=df_matrix.index),
+            var=pd.DataFrame(index=df_matrix.columns),
+        )
+        print(f"  Gene mapping: {len(original_names)} Ensembl -> {adata.shape[0]} symbols "
+              f"({n_unmapped} unmapped dropped)")
 
     print(f"Processing {args.species} | {dataset_id} | matrix shape: {adata.shape}")
     print(f"  TRs in reference: {len(tr_symbols)}")
@@ -164,20 +196,15 @@ def main():
 
     if len(profiles_df) == 0:
         print("  WARNING: No TR profiles extracted!")
-        # Write empty parquet with correct schema
+        # Write empty CSV with correct schema
         profiles_df = pd.DataFrame(
             columns=['tr_symbol', 'ortholog_id', 'coexpr_value', 'dataset_id']
         )
 
-    # Add metadata
-    profiles_df['cell_type'] = cell_type
-    profiles_df['species'] = args.species
-    profiles_df['n_ortho_genes'] = len(ortho_genes & gene_names)
-
     # Save
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    profiles_df.to_parquet(output_path, index=False)
+    profiles_df.to_csv(output_path, index=False)
 
     n_trs = profiles_df['tr_symbol'].nunique()
     print(f"  Saved {len(profiles_df)} rows for {n_trs} TRs -> {output_path}")
