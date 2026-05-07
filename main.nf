@@ -8,9 +8,7 @@ nextflow.enable.dsl=2
  * Workflow:
  *   0. Aggregate coexpression networks across datasets (Crow et al. rank-sum-rerank)
  *   1. Extract TR profiles from aggregate networks in ortholog gene space
- *   2. Extract per-dataset TR profiles for within-species reproducibility
- *   3. Within-species Top-K reproducibility across datasets
- *   4. Cross-species comparison (Spearman, Top-K, Ortholog retrieval)
+ *   2. Cross-species comparison (Spearman, Top-K, Ortholog retrieval)
  */
 
 log.info """\
@@ -70,7 +68,7 @@ process AGGREGATE_NETWORKS {
  */
 process EXTRACT_AGGREGATE_PROFILES {
     tag "${species}/${cell_type}"
-    publishDir "${params.outdir}/02_aggregated", mode: 'copy'
+    publishDir "${params.outdir}/01_aggregated", mode: 'copy'
 
     conda "${params.conda_env}"
 
@@ -96,112 +94,44 @@ process EXTRACT_AGGREGATE_PROFILES {
 }
 
 /*
- * Process 2: Extract per-dataset TR coexpression profiles
+ * Process 2: Cross-species comparison
  *
- * For each per-dataset coexpression matrix (h5ad), extract one profile per TR:
- *   a ranked list of coexpression values restricted to ortholog genes.
- * Used for within-species reproducibility analysis.
- */
-process EXTRACT_TR_PROFILES {
-    tag "${species}/${h5ad.baseName}"
-    publishDir "${params.outdir}/01_tr_profiles/${species}", mode: 'copy'
-
-    conda "${params.conda_env}"
-
-    input:
-    tuple val(species), path(h5ad)
-    path ortholog_file
-    path mouse_tf_file
-    path human_tf_file
-    path mouse_gene_mapping
-
-    output:
-    tuple val(species), path("profiles/${h5ad.baseName}_tr_profiles.csv"), emit: profiles
-
-    script:
-    def mapping_arg = species == 'mouse' ? "--gene_mapping ${mouse_gene_mapping}" : ''
-    """
-    python ${projectDir}/bin/02-extractTRProfiles.py \\
-        --input ${h5ad} \\
-        --ortholog_file ${ortholog_file} \\
-        --mouse_tf_file ${mouse_tf_file} \\
-        --human_tf_file ${human_tf_file} \\
-        --species ${species} \\
-        ${mapping_arg} \\
-        --output profiles/${h5ad.baseName}_tr_profiles.csv
-    """
-}
-
-/*
- * Process 3: Within-species Top-K reproducibility across datasets
- *
- * For each TR, compute mean pairwise Top-K overlap of coexpressed partners
- * across datasets. Also generates a null distribution by randomly pairing
- * different TRs across datasets.
- */
-process REPRODUCIBILITY {
-    tag "${species}/${cell_type}"
-    publishDir "${params.outdir}/01b_reproducibility/${species}", mode: 'copy'
-
-    conda "${params.conda_env}"
-
-    input:
-    tuple val(species), val(cell_type), path("profiles/*")
-
-    output:
-    tuple val(species), val(cell_type), path("${species}_${cell_type}_reproducibility.csv"), emit: reprod
-    tuple val(species), val(cell_type), path("${species}_${cell_type}_reprod_null.csv"), emit: null_dist
-
-    script:
-    """
-    python ${projectDir}/bin/03-reproducibility.py \\
-        --input_dir profiles \\
-        --species ${species} \\
-        --cell_type ${cell_type} \\
-        --top_k ${params.top_k} \\
-        --n_null ${params.n_null} \\
-        --output ${species}_${cell_type}_reproducibility.csv \\
-        --null_output ${species}_${cell_type}_reprod_null.csv
-    """
-}
-
-/*
- * Process 4: Cross-species comparison
- *
- * For each TR with a one-to-one ortholog and >= min_datasets in both species:
- *   - Spearman correlation of aggregate profiles
+ * For each orthologous gene present in both species' aggregate networks
+ * and measured in >= min_datasets per species:
+ *   - Spearman correlation of coexpression profiles
  *   - Top-K overlap (most positively coexpressed)
  *   - Ortholog retrieval score (Top-K overlap based)
- *   - Null distribution (shuffled aggregate profiles across species)
- *   - Gene-centric conservation (TR-based and full-network)
+ *   - Null distribution (randomly paired genes across species)
+ *   - is_TR flag for transcription regulators
  */
 process COMPARE_SPECIES {
     tag "${cell_type}"
-    publishDir "${params.outdir}/03_comparison/${cell_type}", mode: 'copy'
+    publishDir "${params.outdir}/02_comparison/${cell_type}", mode: 'copy'
     memory '16 GB'
 
     conda "${params.conda_env}"
 
     input:
-    tuple val(cell_type), path(human_agg, stageAs: 'human_agg.json'), path(mouse_agg, stageAs: 'mouse_agg.json')
-    tuple val(cell_type2), path(human_agg_h5ad, stageAs: 'human_aggregate.h5ad'), path(mouse_agg_h5ad, stageAs: 'mouse_aggregate.h5ad')
+    tuple val(cell_type), path(human_agg_h5ad, stageAs: 'human_aggregate.h5ad'), path(mouse_agg_h5ad, stageAs: 'mouse_aggregate.h5ad')
     path ortholog_file
     path ribosomal_genes
+    path human_tf_file
+    path mouse_tf_file
 
     output:
     path "${cell_type}_cross_species_results.csv", emit: results
     path "${cell_type}_summary.csv", emit: summary
     path "${cell_type}_cross_species_null.csv", emit: null_dist
-    path "${cell_type}_gene_conservation.csv", emit: gene_conservation
-    path "${cell_type}_gene_conservation_fullnet.csv", emit: gene_conservation_fullnet
 
     script:
     def ribo_arg = ribosomal_genes.name != 'NO_FILE' ? "--ribosomal_genes ${ribosomal_genes}" : ''
     """
-    python ${projectDir}/bin/04-compareSpecies.py \\
-        --human_profiles human_agg.json \\
-        --mouse_profiles mouse_agg.json \\
+    python ${projectDir}/bin/02-compareSpecies.py \\
+        --human_aggregate_h5ad human_aggregate.h5ad \\
+        --mouse_aggregate_h5ad mouse_aggregate.h5ad \\
         --ortholog_file ${ortholog_file} \\
+        --human_tf_file ${human_tf_file} \\
+        --mouse_tf_file ${mouse_tf_file} \\
         --cell_type ${cell_type} \\
         --top_k ${params.top_k} \\
         --min_datasets ${params.min_datasets} \\
@@ -209,10 +139,6 @@ process COMPARE_SPECIES {
         --output ${cell_type}_cross_species_results.csv \\
         --summary ${cell_type}_summary.csv \\
         --null_output ${cell_type}_cross_species_null.csv \\
-        --gene_output ${cell_type}_gene_conservation.csv \\
-        --human_aggregate_h5ad human_aggregate.h5ad \\
-        --mouse_aggregate_h5ad mouse_aggregate.h5ad \\
-        --gene_fullnet_output ${cell_type}_gene_conservation_fullnet.csv \\
         ${ribo_arg}
     """
 }
@@ -234,11 +160,28 @@ workflow {
         .map { file -> tuple('mouse', file) }
 
     // Optionally add human matrices if provided
+    // Priority: use ALL if available, otherwise CTL; never AD
     if (params.human_coexpr_dir) {
         human_h5ad_ch = Channel
             .fromPath("${params.human_coexpr_dir}/*_corAggSparse.h5ad")
             .filter { file -> !file.name.contains('_AD_') }
-            .map { file -> tuple('human', file) }
+            .map { file ->
+                // Filename: {CellType}_{StudyID}_{Condition}_corAggSparse.h5ad
+                def parts = file.baseName.toString().replace('_corAggSparse', '').split('_')
+                def condition = parts[-1]   // ALL or CTL
+                def study_id = parts[1]     // e.g. Lau-2020
+                def cell_type = parts[0]
+                tuple("${cell_type}_${study_id}", condition, file)
+            }
+            .groupTuple(by: 0)  // group by cell_type + study_id
+            .map { key, conditions, files ->
+                // Pick ALL if available, otherwise CTL
+                def idx = conditions.indexOf('ALL')
+                if (idx == -1) idx = conditions.indexOf('CTL')
+                if (idx == -1) return null
+                tuple('human', files[idx])
+            }
+            .filter { it != null }
         all_h5ad_ch = mouse_h5ad_ch.mix(human_h5ad_ch)
     } else {
         all_h5ad_ch = mouse_h5ad_ch
@@ -266,42 +209,9 @@ workflow {
         human_tf_file
     )
 
-    // Process 2: Extract per-dataset TR profiles for reproducibility analysis
-    tr_profiles = EXTRACT_TR_PROFILES(
-        all_h5ad_ch,
-        ortholog_file,
-        mouse_tf_file,
-        human_tf_file,
-        mouse_gene_mapping
-    )
-
-    // Process 3: Group per-dataset profiles by species + cell_type for reproducibility
-    grouped_profiles = tr_profiles.profiles
-        .map { species, profile ->
-            def cell_type = profile.baseName.toString().split('_')[0]
-            tuple(species, cell_type, profile)
-        }
-        .groupTuple(by: [0, 1])
-
-    REPRODUCIBILITY(grouped_profiles)
-
-    // Process 4: Cross-species comparison (only if both species provided)
+    // Process 2: Cross-species comparison (only if both species provided)
     if (params.human_coexpr_dir) {
-        human_agg = aggregated.aggregated
-            .filter { species, cell_type, file -> species == 'human' }
-            .map { species, cell_type, file -> tuple(cell_type, file) }
-
-        mouse_agg = aggregated.aggregated
-            .filter { species, cell_type, file -> species == 'mouse' }
-            .map { species, cell_type, file -> tuple(cell_type, file) }
-
-        // Join on cell_type to pair human + mouse for comparison
-        paired_ch = human_agg.join(mouse_agg)
-            .map { cell_type, human_file, mouse_file ->
-                tuple(cell_type, human_file, mouse_file)
-            }
-
-        // Pair aggregate h5ad networks by cell_type for full-network gene conservation
+        // Pair aggregate h5ad networks by cell_type
         human_agg_h5ad = aggregate_networks.aggregate
             .filter { species, cell_type, file -> species == 'human' }
             .map { species, cell_type, file -> tuple(cell_type, file) }
@@ -315,7 +225,7 @@ workflow {
                 tuple(cell_type, human_file, mouse_file)
             }
 
-        COMPARE_SPECIES(paired_ch, paired_h5ad_ch, ortholog_file, ribosomal_genes)
+        COMPARE_SPECIES(paired_h5ad_ch, ortholog_file, ribosomal_genes, human_tf_file, mouse_tf_file)
     }
 }
 
@@ -329,10 +239,8 @@ workflow.onComplete {
 
         Output Structure:
         - 00_aggregate_networks/{species}/    : Aggregate coexpression matrices (Crow et al.)
-        - 01_tr_profiles/{species}/           : Per-dataset TR profiles in ortholog space
-        - 01b_reproducibility/{species}/      : Top-K reproducibility scores + null distribution
-        - 02_aggregated/                      : TR profiles from aggregate ({species}_{cell_type}_aggregated.json)
-        - 03_comparison/{cell_type}/          : Cross-species comparison results
+        - 01_aggregated/                      : TR profiles from aggregate ({species}_{cell_type}_aggregated.json)
+        - 02_comparison/{cell_type}/          : Cross-species comparison results
         """
         .stripIndent()
 }
